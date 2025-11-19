@@ -479,6 +479,22 @@ def parse_args(input_args=None):
     )
     parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
 
+    parser.add_argument(
+        "--wandb_key",
+        type=str,
+        default=None,
+        help=(
+            'Wandb API key.'
+        ),
+    )
+    parser.add_argument("--wandb_run_id", type=str, default=None,
+                        help="Existing W&B run ID to resume logging into.")
+    parser.add_argument("--wandb_project_name", type=str, default=None,
+                        help="(Optional) Explicit project name when resuming/starting.")
+    parser.add_argument("--tracker_name", type=str, default=None, help="Project tracker name")
+    
+
+
     if input_args is not None:
         args = parser.parse_args(input_args)
     else:
@@ -518,24 +534,20 @@ class DreamBoothDataset(Dataset):
             raise ValueError("Instance images root doesn't exists.")
 
         # Load images.
-        instance_images = [Image.open(path) for path in list(Path(instance_data_root).iterdir())]
-        image_hashes = [self.generate_image_hash(path) for path in list(Path(instance_data_root).iterdir())]
-        self.instance_images = instance_images
-        self.image_hashes = image_hashes
-
+        self.instance_images = [Image.open(path) for path in list(Path(instance_data_root).iterdir())]
+        self.image_hashes = [self.generate_image_hash(path) for path in list(Path(instance_data_root).iterdir())]
         # Image transformations
         self.pixel_values = self.apply_image_transformations(
-            instance_images=instance_images, size=size, center_crop=center_crop
+            instance_images=self.instance_images, size=size, center_crop=center_crop
         )
 
         # Map hashes to embeddings.
         self.data_dict = self.map_image_hash_embedding(data_df_path=data_df_path)
 
-        self.num_instance_images = len(instance_images)
-        self._length = self.num_instance_images
+        self.num_instance_images = len(self.instance_images)
 
     def __len__(self):
-        return self._length
+        return len(self.instance_images)
 
     def __getitem__(self, index):
         example = {}
@@ -651,7 +663,6 @@ def main(args):
     if args.report_to == "wandb":
         if not is_wandb_available():
             raise ImportError("Make sure to install wandb if you want to use it for logging during training.")
-
     # Make one log on every process with the configuration for debugging.
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
@@ -862,17 +873,21 @@ def main(args):
     )
 
     # Scheduler and math around the number of training steps.
-    overrode_max_train_steps = False
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    num_warmup_steps_for_scheduler = args.lr_warmup_steps * accelerator.num_processes
     if args.max_train_steps is None:
-        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
-        overrode_max_train_steps = True
+        len_train_dataloader_after_sharding = math.ceil(len(train_dataloader) / accelerator.num_processes)
+        num_update_steps_per_epoch = math.ceil(len_train_dataloader_after_sharding / args.gradient_accumulation_steps)
+        num_training_steps_for_scheduler = (
+            args.num_train_epochs * num_update_steps_per_epoch * accelerator.num_processes
+        )
+    else:
+        num_training_steps_for_scheduler = args.max_train_steps * accelerator.num_processes
 
     lr_scheduler = get_scheduler(
         args.lr_scheduler,
         optimizer=optimizer,
-        num_warmup_steps=args.lr_warmup_steps * accelerator.num_processes,
-        num_training_steps=args.max_train_steps * accelerator.num_processes,
+        num_warmup_steps=num_warmup_steps_for_scheduler,
+        num_training_steps=num_training_steps_for_scheduler,
         num_cycles=args.lr_num_cycles,
         power=args.lr_power,
     )
@@ -884,7 +899,7 @@ def main(args):
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
-    if overrode_max_train_steps:
+    if args.max_train_steps is None:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
     # Afterwards we recalculate our number of training epochs
     args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
@@ -892,22 +907,35 @@ def main(args):
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
     if accelerator.is_main_process:
-        tracker_name = "dreambooth-sd3-lora-miniature"
-        accelerator.init_trackers(tracker_name, config=vars(args))
+        tracker_name = args.tracker_name or "sd3-lora-dreambooth"
+        if args.report_to == "wandb":
+            wandb.login(key=args.wandb_key)
+
+            if args.wandb_run_id is not None:
+                init_kwargs = {"wandb": {"id": args.wandb_run_id,
+                                        "resume": "must",
+                                        "name": args.wandb_project_name,
+                                        "entity": "slava_"}
+                            }
+            else: init_kwargs = {}
+        accelerator.init_trackers(tracker_name, config=vars(args), init_kwargs=init_kwargs)
 
     # Train!
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
+    num_trainable_parameters = sum(param.numel() for model in params_to_optimize for param in model["params"])
 
-    logger.info("***** Running training *****")
-    logger.info(f"  Num examples = {len(train_dataset)}")
-    logger.info(f"  Num batches each epoch = {len(train_dataloader)}")
-    logger.info(f"  Num Epochs = {args.num_train_epochs}")
-    logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
-    logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
-    logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
-    logger.info(f"  Total optimization steps = {args.max_train_steps}")
     global_step = 0
     first_epoch = 0
+    logger.info("***** Running training *****")
+    logger.info(f"  Num trainable parameters = {num_trainable_parameters}")
+    logger.info(f"  Num update steps per epoch = {num_update_steps_per_epoch}")
+    logger.info(f"  Num examples = {len(train_dataset)}")
+    logger.info(f"  Num batches each epoch = {len(train_dataloader)}")
+    logger.info(f"  Num epochs = {args.num_train_epochs}")
+    logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
+    logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
+    logger.info(f"  Gradient accumulation steps = {args.gradient_accumulation_steps}")
+    logger.info(f"  Total optimization steps = {args.max_train_steps}")
 
     # Potentially load in the weights and states from a previous save
     if args.resume_from_checkpoint:

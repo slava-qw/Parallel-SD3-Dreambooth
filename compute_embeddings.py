@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import argparse
 import glob
 import hashlib
@@ -28,7 +29,7 @@ from diffusers import StableDiffusion3Pipeline
 PROMPT = "a photo of sks dog"
 MAX_SEQ_LENGTH = 77
 LOCAL_DATA_DIR = "dog"
-OUTPUT_PATH = "sample_embeddings.parquet"
+OUTPUT_PATH = "style_embeddings.parquet"
 
 
 def bytes_to_giga_bytes(bytes):
@@ -43,7 +44,7 @@ def generate_image_hash(image_path):
 
 def load_sd3_pipeline():
     id = "stabilityai/stable-diffusion-3-medium-diffusers"
-    text_encoder = T5EncoderModel.from_pretrained(id, subfolder="text_encoder_3", load_in_8bit=True, device_map="auto")
+    text_encoder = T5EncoderModel.from_pretrained(id, subfolder="text_encoder_3", device_map="auto")
     pipeline = StableDiffusion3Pipeline.from_pretrained(
         id, text_encoder_3=text_encoder, transformer=None, vae=None, device_map="balanced"
     )
@@ -76,7 +77,8 @@ def run(args):
 
     # Assumes that the images within `args.local_image_dir` have a JPEG extension. Change
     # as needed.
-    image_paths = glob.glob(f"{args.local_data_dir}/*.jpeg")
+    # image_paths = glob.glob(f"{args.local_data_dir}/*.jpeg")
+    image_paths = glob.glob(f"{args.local_data_dir}/*.png")
     data = []
     for image_path in image_paths:
         img_hash = generate_image_hash(image_path)
@@ -95,13 +97,12 @@ def run(args):
         data,
         columns=["image_hash"] + embedding_cols,
     )
-
     # Convert embedding lists to arrays (for proper storage in parquet)
     for col in embedding_cols:
         df[col] = df[col].apply(lambda x: x.cpu().numpy().flatten().tolist())
 
     # Save the dataframe to a parquet file
-    df.to_parquet(args.output_path)
+    df.to_parquet(os.path.join(args.output_path, OUTPUT_PATH))
     print(f"Data successfully serialized to {args.output_path}")
 
 
