@@ -32,8 +32,10 @@ import torch
 import torch.utils.checkpoint
 import transformers
 from accelerate import Accelerator
+from accelerate.utils import ParallelismConfig, FullyShardedDataParallelPlugin
+
 from accelerate.logging import get_logger
-from accelerate.utils import DistributedDataParallelKwargs, ProjectConfiguration, set_seed
+from accelerate.utils import DistributedDataParallelKwargs, InitProcessGroupKwargs, ProjectConfiguration, set_seed
 from huggingface_hub import create_repo, upload_folder
 from peft import LoraConfig, set_peft_model_state_dict
 from peft.utils import get_peft_model_state_dict
@@ -64,6 +66,15 @@ from diffusers.utils import (
 )
 from diffusers.utils.hub_utils import load_or_create_model_card, populate_model_card
 from diffusers.utils.torch_utils import is_compiled_module
+
+
+from torch.profiler import profile, ProfilerActivity, schedule, tensorboard_trace_handler
+from torch.autograd.profiler import record_function
+from pathlib import Path
+from datetime import timedelta
+
+
+# from context_parallel_hooks import enable_context_parallel, cp_basic, cp_ring
 
 
 if is_wandb_available():
@@ -308,7 +319,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--checkpointing_steps",
         type=int,
-        default=500,
+        default=5000,
         help=(
             "Save a checkpoint of the training state every X updates. These checkpoints can be used both as final"
             " checkpoints in case they are better than the last checkpoint, and are also suitable for resuming"
@@ -459,7 +470,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--mixed_precision",
         type=str,
-        default=None,
+        default="fp16",
         choices=["no", "fp16", "bf16"],
         help=(
             "Whether to use mixed precision. Choose between fp16 and bf16 (bfloat16). Bf16 requires PyTorch >="
@@ -478,6 +489,10 @@ def parse_args(input_args=None):
         ),
     )
     parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
+    parser.add_argument(
+    "--enable_cp", action="store_true", default=False,
+    help="(Diffusers hooks path) Enable Context Parallelism. Keep this OFF when using Accelerate-CP."
+    )
 
     parser.add_argument(
         "--wandb_key",
@@ -494,6 +509,35 @@ def parse_args(input_args=None):
     parser.add_argument("--tracker_name", type=str, default=None, help="Project tracker name")
     
 
+    # for profiling
+    parser.add_argument("--profile", action="store_true",
+                        help="Enable PyTorch Profiler (rank-0 by default).")
+    parser.add_argument("--profile_all_ranks", action="store_true",
+                        help="Profile every rank (more data, more overhead).")
+    parser.add_argument("--profile_wait", type=int, default=150,
+                        help="Profiler schedule: wait steps.")
+    parser.add_argument("--profile_warmup", type=int, default=10,
+                        help="Profiler schedule: warmup steps.")
+    parser.add_argument("--profile_active", type=int, default=5,
+                        help="Profiler schedule: active steps recorded.")
+    parser.add_argument("--profile_repeat", type=int, default=3,
+                        help="Number of schedule repeats.")
+    parser.add_argument("--profile_record_shapes", action="store_true",
+                        help="Record input shapes.")
+    parser.add_argument("--profile_memory", action="store_true",
+                        help="Track memory usage.")
+    parser.add_argument("--profile_with_stack", action="store_true",
+                        help="Capture Python stacks (adds overhead).")
+    parser.add_argument("--profile_dir", type=str, default="profiler",
+                        help="Subdir under output_dir for trace files.")
+
+    parser.add_argument(
+        "--profile_export",
+        type=str,
+        default="tb",   # choose: "tb" or "perfetto" or "alternate"
+        choices=["tb", "perfetto", "alternate"],
+        help="How to export profiler traces."
+    )
 
     if input_args is not None:
         args = parser.parse_args(input_args)
@@ -648,13 +692,99 @@ def main(args):
 
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
     kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+
+    # FSDP2 plugin: prefer sharded state dicts; disable RAM-efficient loading for now
+    fsdp_plugin = FullyShardedDataParallelPlugin(
+        fsdp_version=2,
+        state_dict_type="SHARDED_STATE_DICT",
+        cpu_ram_efficient_loading=False,  # avoids a known device-mesh/TP/CP loader issue
+        activation_checkpointing=False,
+    )
+
+    # You’ll override cp/dp sizes from CLI/launch; defaults are safe for single-GPU debug
+    pc = ParallelismConfig(
+        dp_shard_size=1,       # degree of FSDP sharding
+        dp_replicate_size=1,   # number of replicas (classic data parallel)
+        cp_size=1,             # context parallel degree
+        tp_size=4,             # not using TP here
+    )
+    # https://github.com/huggingface/diffusers/issues/9500#issuecomment-2369363617
+    ipg = InitProcessGroupKwargs(timeout=timedelta(minutes=30))
+
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
         log_with=args.report_to,
         project_config=accelerator_project_config,
-        kwargs_handlers=[kwargs],
+        kwargs_handlers=[ipg, kwargs],
+        # fsdp_plugin=fsdp_plugin,
+        # parallelism_config=pc,
     )
+    print("ZeRO stage:", getattr(accelerator.state.deepspeed_plugin, "zero_stage", None))
+
+    # ---------- Profiler setup ----------
+    should_profile = args.profile and (accelerator.is_local_main_process or args.profile_all_ranks)
+
+    stage = None
+    if getattr(accelerator.state, "deepspeed_plugin", None) is not None:
+        z = getattr(accelerator.state.deepspeed_plugin, "zero_stage", None)
+        stage = f"zero{z}" if z else "deepspeed"
+    elif getattr(accelerator.state, "fsdp_plugin", None) is not None:
+        stage = "fsdp"
+    else:
+        stage = "ddp"
+
+    # after you compute: stage, profile_root/tb_logdir, etc.
+    tb_logdir = Path(args.output_dir) / "tb_profiler" / f"{stage}_ws{accelerator.num_processes}"
+    perf_root = Path(args.output_dir) / "perfetto" / f"{stage}_ws{accelerator.num_processes}"
+    if accelerator.is_local_main_process:
+        tb_logdir.mkdir(parents=True, exist_ok=True)
+        perf_root.mkdir(parents=True, exist_ok=True)
+
+    # keep state across windows so we can alternate if requested
+    _window_idx = {"i": 0}
+
+    def _on_trace_ready(prof):
+        # Option A: TensorBoard (recommended for TB memory panes)
+        if args.profile_export == "tb":
+            handler = tensorboard_trace_handler(
+                dir_name=str(tb_logdir),
+                worker_name=f"rank{accelerator.local_process_index}_ws{accelerator.num_processes}"
+            )
+            handler(prof)  # writes TB files
+            return
+
+        # Option B: Perfetto/Chrome JSON (fast viewer)
+        if args.profile_export == "perfetto":
+            json_path = perf_root / f"trace_rank{accelerator.local_process_index}_step{global_step}.json"
+            prof.export_chrome_trace(str(json_path))
+            if accelerator.is_local_main_process:
+                logger.info(f"[profiler] wrote {json_path}")
+            return
+
+    if should_profile:
+        activities = [ProfilerActivity.CPU]
+        if torch.cuda.is_available():
+            activities.append(ProfilerActivity.CUDA)
+
+        prof = profile(
+            activities=activities,
+            schedule=schedule(wait=args.profile_wait,
+                            warmup=args.profile_warmup,
+                            active=args.profile_active,
+                            repeat=args.profile_repeat),
+            on_trace_ready=_on_trace_ready,
+            record_shapes=args.profile_record_shapes,
+            profile_memory=args.profile_memory,
+            with_stack=args.profile_with_stack,
+            with_modules=True,
+        )
+        prof_step = prof.step
+    else:
+        from contextlib import nullcontext
+        prof = nullcontext()
+        prof_step = lambda: None
+    # -----------------------------------
 
     # Disable AMP for MPS.
     if torch.backends.mps.is_available():
@@ -704,7 +834,8 @@ def main(args):
         variant=args.variant,
     )
     transformer = SD3Transformer2DModel.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="transformer", revision=args.revision, variant=args.variant
+        args.pretrained_model_name_or_path, subfolder="transformer", revision=args.revision, variant=args.variant,
+        # tp_plan='auto'
     )
 
     transformer.requires_grad_(False)
@@ -738,6 +869,13 @@ def main(args):
         target_modules=["to_k", "to_q", "to_v", "to_out.0"],
     )
     transformer.add_adapter(transformer_lora_config)
+
+    # if args.enable_cp:
+    #     logger.info("Enable CP for transformer module")
+    #     cfg_kwargs, plan = cp_basic(transformer)  # or cp_ring / cp_joint_only / cp_block_gather
+    #     enable_context_parallel(transformer, **cfg_kwargs, cp_plan=plan, world=accelerator.num_processes)
+    #     logger.info("Finished CP prep")
+
 
     def unwrap_model(model):
         model = accelerator.unwrap_model(model)
@@ -821,6 +959,7 @@ def main(args):
     transformer_parameters_with_lr = {"params": transformer_lora_parameters, "lr": args.learning_rate}
     params_to_optimize = [transformer_parameters_with_lr]
 
+    print(f'before prepare: num_trainable_parameters={sum(param.numel() for model in params_to_optimize for param in model["params"])}')
     # Optimizer creation
     if not args.optimizer.lower() == "adamw":
         logger.warning(
@@ -907,14 +1046,14 @@ def main(args):
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
     if accelerator.is_main_process:
-        tracker_name = args.tracker_name or "sd3-lora-dreambooth"
+        tracker_name = args.tracker_name or "sd3-lora-dreambooth-parallel"
         if args.report_to == "wandb":
             wandb.login(key=args.wandb_key)
 
             if args.wandb_run_id is not None:
                 init_kwargs = {"wandb": {"id": args.wandb_run_id,
                                         "resume": "must",
-                                        "name": args.wandb_project_name,
+                                        # "name": args.wandb_project_name,
                                         "entity": "slava_"}
                             }
             else: init_kwargs = {}
@@ -984,136 +1123,149 @@ def main(args):
             sigma = sigma.unsqueeze(-1)
         return sigma
 
-    for epoch in range(first_epoch, args.num_train_epochs):
-        transformer.train()
+    with prof:
+        for epoch in range(first_epoch, args.num_train_epochs):
+            transformer.train()
 
-        for step, batch in enumerate(train_dataloader):
-            models_to_accumulate = [transformer]
-            with accelerator.accumulate(models_to_accumulate):
-                pixel_values = batch["pixel_values"].to(dtype=vae.dtype)
+            for step, batch in enumerate(train_dataloader):
+                models_to_accumulate = [transformer]
+                with accelerator.accumulate(models_to_accumulate):
+                    with record_function("data.to_device"):
+                        pixel_values = batch["pixel_values"].to(dtype=vae.dtype)
 
-                # Convert images to latent space
-                model_input = vae.encode(pixel_values).latent_dist.sample()
-                model_input = model_input * vae.config.scaling_factor
-                model_input = model_input.to(dtype=weight_dtype)
+                    # Convert images to latent space
+                    with record_function("vae.encode"):
+                        model_input = vae.encode(pixel_values).latent_dist.sample()
+                        model_input = model_input * vae.config.scaling_factor
+                        model_input = model_input.to(dtype=weight_dtype)
+                    
+                    with record_function("noise.sample+sigmas"):
+                        # Sample noise that we'll add to the latents
+                        noise = torch.randn_like(model_input)
+                        bsz = model_input.shape[0]
 
-                # Sample noise that we'll add to the latents
-                noise = torch.randn_like(model_input)
-                bsz = model_input.shape[0]
+                        # Sample a random timestep for each image
+                        # for weighting schemes where we sample timesteps non-uniformly
+                        u = compute_density_for_timestep_sampling(
+                            weighting_scheme=args.weighting_scheme,
+                            batch_size=bsz,
+                            logit_mean=args.logit_mean,
+                            logit_std=args.logit_std,
+                            mode_scale=args.mode_scale,
+                        )
+                        indices = (u * noise_scheduler_copy.config.num_train_timesteps).long()
+                        timesteps = noise_scheduler_copy.timesteps[indices].to(device=model_input.device)
 
-                # Sample a random timestep for each image
-                # for weighting schemes where we sample timesteps non-uniformly
-                u = compute_density_for_timestep_sampling(
-                    weighting_scheme=args.weighting_scheme,
-                    batch_size=bsz,
-                    logit_mean=args.logit_mean,
-                    logit_std=args.logit_std,
-                    mode_scale=args.mode_scale,
-                )
-                indices = (u * noise_scheduler_copy.config.num_train_timesteps).long()
-                timesteps = noise_scheduler_copy.timesteps[indices].to(device=model_input.device)
+                        # Add noise according to flow matching.
+                        sigmas = get_sigmas(timesteps, n_dim=model_input.ndim, dtype=model_input.dtype)
+                        noisy_model_input = sigmas * noise + (1.0 - sigmas) * model_input
+                    with record_function("batch.to_device/prompts"):
+                        # Predict the noise residual
+                        prompt_embeds, pooled_prompt_embeds = batch["prompt_embeds"], batch["pooled_prompt_embeds"]
+                        prompt_embeds = prompt_embeds.to(device=accelerator.device, dtype=weight_dtype)
+                        pooled_prompt_embeds = pooled_prompt_embeds.to(device=accelerator.device, dtype=weight_dtype)
+                        
+                    with record_function("transformer.forward"):
+                        model_pred = transformer(
+                            hidden_states=noisy_model_input,
+                            timestep=timesteps,
+                            encoder_hidden_states=prompt_embeds,
+                            pooled_projections=pooled_prompt_embeds,
+                            return_dict=False,
+                        )[0]
 
-                # Add noise according to flow matching.
-                sigmas = get_sigmas(timesteps, n_dim=model_input.ndim, dtype=model_input.dtype)
-                noisy_model_input = sigmas * noise + (1.0 - sigmas) * model_input
+                    with record_function("loss.compute+precondition"):
+                        # Follow: Section 5 of https://huggingface.co/papers/2206.00364.
+                        # Preconditioning of the model outputs.
+                        model_pred = model_pred * (-sigmas) + noisy_model_input
 
-                # Predict the noise residual
-                prompt_embeds, pooled_prompt_embeds = batch["prompt_embeds"], batch["pooled_prompt_embeds"]
-                prompt_embeds = prompt_embeds.to(device=accelerator.device, dtype=weight_dtype)
-                pooled_prompt_embeds = pooled_prompt_embeds.to(device=accelerator.device, dtype=weight_dtype)
-                model_pred = transformer(
-                    hidden_states=noisy_model_input,
-                    timestep=timesteps,
-                    encoder_hidden_states=prompt_embeds,
-                    pooled_projections=pooled_prompt_embeds,
-                    return_dict=False,
-                )[0]
+                        # these weighting schemes use a uniform timestep sampling
+                        # and instead post-weight the loss
+                        weighting = compute_loss_weighting_for_sd3(weighting_scheme=args.weighting_scheme, sigmas=sigmas)
 
-                # Follow: Section 5 of https://huggingface.co/papers/2206.00364.
-                # Preconditioning of the model outputs.
-                model_pred = model_pred * (-sigmas) + noisy_model_input
+                        # flow matching loss
+                        target = model_input
 
-                # these weighting schemes use a uniform timestep sampling
-                # and instead post-weight the loss
-                weighting = compute_loss_weighting_for_sd3(weighting_scheme=args.weighting_scheme, sigmas=sigmas)
+                        # Compute regular loss.
+                        loss = torch.mean(
+                            (weighting.float() * (model_pred.float() - target.float()) ** 2).reshape(target.shape[0], -1),
+                            1,
+                        )
+                        loss = loss.mean()
 
-                # flow matching loss
-                target = model_input
+                    with record_function("backward"):
+                        accelerator.backward(loss)
+                    if accelerator.sync_gradients:
+                        with record_function("clip"):
+                            params_to_clip = transformer_lora_parameters
+                            accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+                    with record_function("+opt_step+lr_step+grad"):
+                        optimizer.step()
+                        lr_scheduler.step()
+                        optimizer.zero_grad()
 
-                # Compute regular loss.
-                loss = torch.mean(
-                    (weighting.float() * (model_pred.float() - target.float()) ** 2).reshape(target.shape[0], -1),
-                    1,
-                )
-                loss = loss.mean()
+                prof_step()
 
-                accelerator.backward(loss)
+                # Checks if the accelerator has performed an optimization step behind the scenes
                 if accelerator.sync_gradients:
-                    params_to_clip = transformer_lora_parameters
-                    accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+                    progress_bar.update(1)
+                    global_step += 1
 
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad()
+                    if accelerator.is_main_process:
+                        if global_step % args.checkpointing_steps == 0:
+                            # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
+                            if args.checkpoints_total_limit is not None:
+                                checkpoints = os.listdir(args.output_dir)
+                                checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
+                                checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
 
-            # Checks if the accelerator has performed an optimization step behind the scenes
-            if accelerator.sync_gradients:
-                progress_bar.update(1)
-                global_step += 1
+                                # before we save the new checkpoint, we need to have at _most_ `checkpoints_total_limit - 1` checkpoints
+                                if len(checkpoints) >= args.checkpoints_total_limit:
+                                    num_to_remove = len(checkpoints) - args.checkpoints_total_limit + 1
+                                    removing_checkpoints = checkpoints[0:num_to_remove]
 
-                if accelerator.is_main_process:
+                                    logger.info(
+                                        f"{len(checkpoints)} checkpoints already exist, removing {len(removing_checkpoints)} checkpoints"
+                                    )
+                                    logger.info(f"removing checkpoints: {', '.join(removing_checkpoints)}")
+
+                                    for removing_checkpoint in removing_checkpoints:
+                                        removing_checkpoint = os.path.join(args.output_dir, removing_checkpoint)
+                                        shutil.rmtree(removing_checkpoint)
+
+                    # https://github.com/huggingface/diffusers/issues/2606
                     if global_step % args.checkpointing_steps == 0:
-                        # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
-                        if args.checkpoints_total_limit is not None:
-                            checkpoints = os.listdir(args.output_dir)
-                            checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
-                            checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
-
-                            # before we save the new checkpoint, we need to have at _most_ `checkpoints_total_limit - 1` checkpoints
-                            if len(checkpoints) >= args.checkpoints_total_limit:
-                                num_to_remove = len(checkpoints) - args.checkpoints_total_limit + 1
-                                removing_checkpoints = checkpoints[0:num_to_remove]
-
-                                logger.info(
-                                    f"{len(checkpoints)} checkpoints already exist, removing {len(removing_checkpoints)} checkpoints"
-                                )
-                                logger.info(f"removing checkpoints: {', '.join(removing_checkpoints)}")
-
-                                for removing_checkpoint in removing_checkpoints:
-                                    removing_checkpoint = os.path.join(args.output_dir, removing_checkpoint)
-                                    shutil.rmtree(removing_checkpoint)
-
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
 
-            logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
-            progress_bar.set_postfix(**logs)
-            accelerator.log(logs, step=global_step)
+                logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+                progress_bar.set_postfix(**logs)
+                accelerator.log(logs, step=global_step)
 
-            if global_step >= args.max_train_steps:
-                break
+                if global_step >= args.max_train_steps:
+                    break
 
-        if accelerator.is_main_process:
-            if args.validation_prompt is not None and epoch % args.validation_epochs == 0:
-                pipeline = StableDiffusion3Pipeline.from_pretrained(
-                    args.pretrained_model_name_or_path,
-                    vae=vae,
-                    transformer=accelerator.unwrap_model(transformer),
-                    revision=args.revision,
-                    variant=args.variant,
-                    torch_dtype=weight_dtype,
-                )
-                pipeline_args = {"prompt": args.validation_prompt}
-                images = log_validation(
-                    pipeline=pipeline,
-                    args=args,
-                    accelerator=accelerator,
-                    pipeline_args=pipeline_args,
-                    epoch=epoch,
-                )
-                torch.cuda.empty_cache()
-                gc.collect()
+            if accelerator.is_main_process:
+                if args.validation_prompt is not None and epoch % args.validation_epochs == 0:
+                    pipeline = StableDiffusion3Pipeline.from_pretrained(
+                        args.pretrained_model_name_or_path,
+                        vae=vae,
+                        transformer=accelerator.unwrap_model(transformer),
+                        revision=args.revision,
+                        variant=args.variant,
+                        torch_dtype=weight_dtype,
+                    )
+                    pipeline_args = {"prompt": args.validation_prompt}
+                    images = log_validation(
+                        pipeline=pipeline,
+                        args=args,
+                        accelerator=accelerator,
+                        pipeline_args=pipeline_args,
+                        epoch=epoch,
+                    )
+                    torch.cuda.empty_cache()
+                    gc.collect()
 
     # Save the lora layers
     accelerator.wait_for_everyone()
@@ -1121,7 +1273,7 @@ def main(args):
         transformer = unwrap_model(transformer)
         transformer = transformer.to(torch.float32)
         transformer_lora_layers = get_peft_model_state_dict(transformer)
-
+        #TODO: # https://github.com/huggingface/diffusers/issues/2606
         StableDiffusion3Pipeline.save_lora_weights(
             save_directory=args.output_dir,
             transformer_lora_layers=transformer_lora_layers,
